@@ -1,0 +1,1561 @@
+---
+title: "cbio.tas.104"
+author: "Analyst: mcm"
+output:
+  html_document:
+    code_folding: hide
+    collapsed: yes
+    highlight: tango
+    number_sections: no
+    theme: yeti
+    toc: yes
+    toc_float: yes
+fontsize: 25pt
+---
+
+<style>
+    body {
+        text-align: justify;
+    }
+
+    .main-container {
+        max-width: 1600px;
+        margin-left: auto;
+        margin-right: auto;
+    }
+
+    div.main-container {
+        max-width: 1600px;
+    }
+</style>
+
+## Objective
+
+PacBio sequencing of RNA-seq for human samples. Looking for non-human pathogen sequences. The samples [MOLNG-2841](https://lims.stowers.org/#/molecular-biology/ngs/requests/178052) are the mRNA samples, [MOLNG-2837](https://lims.stowers.org/#/molecular-biology/ngs/requests/177970) have synthetic polyA tails added to them for sequencing.
+
+## Data
+
+Pacbio mRNA Iso-Seq from Sequel-II. Outsourced to CSHL. 12 samples, each done once with totalRNA and once with mRNA.
+
+## Methods
+
+First, Cynthia ran pacbio isoseq software to generate consensus high quality transcripts in fastq format. Aligned these high quality fastq files to hg38 using minimap2 2.16 with pacbio full length transcript settings (-ax splice:hq). Pulled unaligned transcripts from the bam files and put into fastq.gz files. Converted those to fasta and used blast+ (2.10.0) to blast them to the "nt" blast database (1-29-2020). 
+
+## Results
+
+### Examining unmapped transcripts 
+
+Setting up R, reading in file with sample info, setting colors for plotting.
+
+``` {r setup, echo=TRUE, message=FALSE, results="hide", warning=FALSE, eval=TRUE}
+require(knitr)
+opts_knit$set(root.dir="/n/facility/Bioinformatics/analysis/Workman/tas/cbio.tas.104/data")
+```
+
+``` {r barplots, echo=TRUE, message=FALSE, results="hide", warning=FALSE, eval=FALSE}
+library(rmarkdown)
+library(RColorBrewer)
+library(UpSetR)
+library(ComplexHeatmap)
+#to do
+
+targets<-read.table("../code/targets.txt",sep='\t',as.is=T,header=T)
+
+#read in bam_stats
+multiqc_total<-read.table("/n/analysis/Workman/tas/MOLNG-2837/DA020569/multiqc_data/multiqc_general_stats.txt",sep='\t',as.is=T,header=T)
+multiqc_mrna<-read.table("/n/analysis/Workman/tas/MOLNG-2841/DA020570/multiqc_data/multiqc_general_stats.txt",sep='\t',as.is=T,header=T)
+bam_stats<-read.table("../code/minimap2_hq/bam_stats.txt",sep='\t',header=T,as.is=T)
+
+targets$orig_numreads[1:12]<-multiqc_total[match(gsub(".fastq.gz","",targets$file[1:12]),multiqc_total[,1]),4]
+targets$orig_numreads[13:24]<-multiqc_mrna[match(gsub(".fastq.gz","",targets$file[13:24]),multiqc_total[,1]),4]
+
+cols<-rep(brewer.pal(3,"Dark2")[1:2],each=12)
+png("barplot_transcripts.png",height=600,width=800)
+par(mar=c(10,6,3,2))
+barplot(targets$orig_numreads,las=2,names.arg=targets$alias,col=cols,ylab="# of high quality ccs transcripts",cex.axis=.8,main="Number of Transcripts")
+dev.off()
+
+targets_lq<-read.table("../code/targets_lq.txt",sep='\t',as.is=T,header=T)
+for(i in 1:length(targets_lq$alias))
+{
+	res<-as.numeric(system(paste("gunzip -c ",targets_lq$path[i],"/",targets_lq$file[i]," | wc -l\n",sep=''),intern=T))/4
+	targets_lq$orig_numreads[i]<-res
+}
+
+png("barplot_transcripts_lq.png",height=600,width=800)
+par(mar=c(10,6,3,2))
+barplot(targets_lq$orig_numreads,las=2,names.arg=targets$alias,col=cols,ylab="# of low quality ccs transcripts",cex.axis=.8,main="Number of Transcripts")
+dev.off()
+
+clusters<-list()
+for(i in 1:length(targets$alias))
+{
+	cluster_report_filename<-gsub(".hq.fastq.gz",".cluster_report.csv",targets$file[i])
+	temp<-read.csv(paste(targets$path[i],"/",cluster_report_filename,sep=''),as.is=T,sep=',')
+	temp.df<-data.frame(table(temp$cluster_id))
+	colnames(temp.df)<-c("transcript_id",targets$alias[i])
+	clusters[[i]]<-temp.df
+}
+names(clusters)<-targets$alias
+all_tx<-unique(unlist(lapply(clusters,function(x){x[,1]})))
+tx.df<-data.frame(as.character(all_tx),as.data.frame(lapply(clusters,function(x){x[match(all_tx,x[,1]),2]})),stringsAsFactors=FALSE)
+colnames(tx.df)<-c("txid",targets$alias)
+
+#get counts of tx on genes
+#instead tas19_total.sorted.bam.featureCounts
+d<-read.table(paste("../code/minimap2_hq/",targets$alias[1],".sorted.bam.featureCounts",sep=''),sep='\t',as.is=T,header=F)
+fc<-list()
+bt<-list()
+for(i in 1:length(targets$alias))
+{
+	d<-read.table(paste("../code/minimap2_hq/",targets$alias[i],".sorted.bam.featureCounts",sep=''),sep='\t',as.is=T,header=F)
+	b<-read.table(paste("../code/minimap2_hq/",targets$alias[i],".sorted.intersect.all.txt",sep=''),sep='\t',as.is=T,header=F)
+
+	fc[[i]]<-d[d[,2]=="Assigned",]
+	fc[[i]]<-fc[[i]][!duplicated(fc[[i]]),]
+
+	temp<-unique(b[,c(4,10)])
+	bt[[i]]<-temp
+}
+
+#instead use sqanti2 output tas19_mrna.collapsed_classification.txt
+sq<-list()
+for(i in 1:length(targets$alias))
+{
+	cupcake<-read.table(paste("../code/cupcake/",targets$alias[i],".collapsed.abundance.txt",sep=''),sep='\t',as.is=T,header=T)
+
+	d<-read.table(paste("../code/",targets$alias[i],".collapsed_classification.txt",sep=''),sep='\t',as.is=T,header=T)
+	d$count_fl<-cupcake[match(d[,1],cupcake[,1]),"count_fl"]
+	d$norm_fl<-cupcake[match(d[,1],cupcake[,1]),"norm_fl"]
+	sq[[i]]<-d
+}
+
+tapply(sq_selected[[1]]$count_fl,sq_selected[[1]]$associated_gene,sum)
+
+sq_selected<-lapply(sq,function(x){x[,c("isoform","associated_gene","associated_transcript","count_fl","norm_fl")]})
+sq_selected_genes<-lapply(sq_selected,function(x){data.frame(gene=names(tapply(x$count_fl,x$associated_gene,sum)),count_fl=tapply(x$count_fl,x$associated_gene,sum))})
+
+all_genes<-lapply(sq_selected_genes,function(x){x$gene})
+everygene<-as.character(unique(unlist(all_genes)))
+#need genes that appear in every sample too
+genes_in_every_sample<-as.character(Reduce(intersect,all_genes))
+
+#make one big table with every gene
+names(sq_selected_genes)<-targets$alias
+sq.bigtable<-data.frame(matrix(NA,nrow=length(everygene),ncol=(1+length(targets$alias))))
+sq.bigtable[,1]<-everygene
+for(i in 1:length(sq_selected_genes))
+{
+	j<-i+1
+	sq.bigtable[,j]<-sq_selected_genes[[i]][match(everygene,as.character(sq_selected_genes[[i]]$gene)),2]
+}
+colnames(sq.bigtable)<-c("gene",targets$alias)
+
+#removing the NA line
+sq.bigtable<-sq.bigtable[2:length(sq.bigtable[,1]),]
+
+#how many genes are present in at least two samples? 12399
+length(which(rowSums(is.na(sq.bigtable)) < 23))
+
+sq.at_least_two<-sq.bigtable[rowSums(is.na(sq.bigtable)) < 23,]
+#sub zero
+sq.at_least_two[is.na(sq.at_least_two)]<-0
+
+#now, assign ccs counts to genes
+ccs<-data.frame(ensid=genedata[,1],matrix(ncol=length(targets$alias),nrow=length(genedata[,1])),stringsAsFactors=F)
+colnames(ccs)[2:length(ccs[1,])]<-targets$alias
+
+ccs_bt<-data.frame(ensid=genedata[,1],matrix(ncol=length(targets$alias),nrow=length(genedata[,1])),stringsAsFactors=F)
+colnames(ccs_bt)[2:length(ccs_bt[1,])]<-targets$alias
+
+#why all NAs?
+for(i in 1:length(ccs[,1]))
+#for(i in 4838:length(ccs[,1]))
+{
+	for(j in 1:length(targets$alias))
+	{
+		#get the tx in this sample that matched this gene and sum their ccs counts
+		tx<-fc[[j]][fc[[j]][,4]==ccs[i,1],1]
+		if(length(tx)> 0)
+		{
+			ccs[i,(j+1)]<-sum(tx.df[tx.df[,1] %in% tx,(j+1)])
+		}
+
+		tx<-bt[[j]][bt[[j]][,1]==ccs_bt[i,1],2]
+		if(length(tx)> 0)
+		{
+			ccs_bt[i,(j+1)]<-sum(tx.df[tx.df[,1] %in% tx,(j+1)])
+		}
+	}
+}
+
+ccs_nz<-ccs[which(rowSums(ccs[,2:length(ccs[1,])],na.rm=T) > 0),]
+ccs_nz[is.na(ccs_nz)]<-0
+
+ccs_bt_nz<-ccs_bt[which(rowSums(ccs_bt[,2:length(ccs_bt[1,])],na.rm=T) > 0),]
+ccs_bt_nz[is.na(ccs_bt_nz)]<-0
+
+#figure out how many reads aligned to human
+for(i in 1:length(targets$alias))
+{
+	temp<-as.numeric(system(paste("samtools view -F 4 ../code/minimap2_hq/",targets$alias[i],".sorted.bam | cut -f 1 | sort | uniq | wc -l",sep=''),intern=T))
+	targets$num_reads_aligned_hq[i]<-temp
+}
+#lq
+for(i in 1:length(targets_lq$alias))
+{
+	temp<-as.numeric(system(paste("samtools view -F 4 ../code/minimap2_lq/",targets_lq$alias[i],".sorted.bam | cut -f 1 | sort | uniq | wc -l",sep=''),intern=T))
+	targets_lq$num_reads_aligned_lq[i]<-temp
+}
+
+targets$pct_aln<-targets$num_reads_aligned_hq/targets$orig_numreads
+targets_lq$pct_aln<-targets_lq$num_reads_aligned_lq/targets_lq$orig_numreads
+
+cols<-rep(brewer.pal(3,"Dark2")[1:2],each=12)
+png("barplot_alignments.png",height=600,width=800)
+par(mar=c(10,6,3,2))
+barplot(targets$num_reads_aligned_hq,las=2,names.arg=targets$alias,col=cols,ylab="# of transcripts aligned to human",cex.axis=.8,main="Number of Transcripts Aligned")
+dev.off()
+
+png("barplot_alignments_pct.png",height=600,width=800)
+par(mar=c(10,6,3,2))
+barplot(targets$pct_aln,las=2,names.arg=targets$alias,col=cols,ylab="% of transcripts aligned to human",cex.axis=.8,main="% of Transcripts Aligned to human",ylim=c(0,1))
+dev.off()
+
+png("barplot_alignments_lq.png",height=600,width=800)
+par(mar=c(10,6,3,2))
+barplot(targets_lq$num_reads_aligned_lq,las=2,names.arg=targets_lq$alias,col=cols,ylab="# of lq transcripts aligned to human",cex.axis=.8,main="Number of Transcripts Aligned")
+dev.off()
+
+png("barplot_alignments_pct_lq.png",height=600,width=800)
+par(mar=c(10,6,3,2))
+barplot(targets_lq$pct_aln,las=2,names.arg=targets_lq$alias,col=cols,ylab="% of lq transcripts aligned to human",cex.axis=.8,main="% of lq Transcripts Aligned to human",ylim=c(0,1))
+dev.off()
+
+
+pdf("transcript_length_hist.pdf")
+for(i in 1:length(targets$alias))
+{
+	count<-read.table(paste("../code/minimap2_hq/",targets$alias[i],".unmapped.fastq.gz.counts.txt",sep=''),sep='\t',header=F,as.is=T)
+	targets[i,"count"]<-count/4
+
+	lengths<-read.table(paste("../code/minimap2_hq/",targets$alias[i],".fa.lengths.txt",sep=''),sep='\t',header=F,as.is=T)
+	hist(lengths[,2],breaks=40,col='blue',main=paste(targets$alias[i]," (",length(lengths[,1])," transcripts)",sep=''),xlab="transcript length")
+}
+dev.off()
+
+pdf("transcript_length_hist_lq.pdf")
+for(i in 1:length(targets_lq$alias))
+{
+	count<-read.table(paste("../code/minimap2_lq/",targets_lq$alias[i],".unmapped.fastq.gz.counts.txt",sep=''),sep='\t',header=F,as.is=T)
+	targets_lq[i,"count"]<-count/4
+
+	if(file.exists(paste("../code/minimap2_lq/",targets_lq$alias[i],".fa.lengths.txt",sep='')))
+	{
+		lengths<-read.table(paste("../code/minimap2_lq/",targets_lq$alias[i],".fa.lengths.txt",sep=''),sep='\t',header=F,as.is=T)
+		hist(lengths[,2],breaks=40,col='blue',main=paste(targets_lq$alias[i]," (",length(lengths[,1])," transcripts)",sep=''),xlab="transcript length")
+	}
+}
+dev.off()
+
+
+png("barplot.png",height=800,width=1200,pointsize=16)
+par(mar=c(8,5,3,1))
+barplot(targets$count,names.arg=targets$alias,las=2,cex.names=.6,col=cols,main="# of unmapped transcripts (after human minimap2 alignment)") 
+dev.off()
+
+png("barplot_lq.png",height=800,width=1200,pointsize=16)
+par(mar=c(8,5,3,1))
+barplot(targets_lq$count,names.arg=targets$alias,las=2,cex.names=.6,col=cols,main="# of unmapped lq transcripts (after human minimap2 alignment)") 
+dev.off()
+
+
+blastresults<-list()
+blastresults_nocutoff<-list()
+blastresults_clips<-list()
+blastresults_clips_nocutoff<-list()
+
+blastresults_lq<-list()
+blastresults_lq_nocutoff<-list()
+for(i in 1:length(targets[,1]))
+{
+	curfile<-read.table(paste("newblast_hq/",targets$alias[i],".blast.tsv",sep=''),sep='\t',header=F,as.is=T,quote="",comment.char="")
+	colnames(curfile)<-c("qseqid","sseqid","evalue","bitscore","sgi","sacc","staxids","sscinames","scomnames","stitle")
+	curfile_onecopy<-curfile[!duplicated(curfile[,1]),]
+	blastresults[[i]]<-curfile_onecopy
+	blastresults_nocutoff[[i]]<-curfile
+
+	curfile<-read.table(paste("newblast_hq_clips/",targets$alias[i],".blast_clips.tsv",sep=''),sep='\t',header=F,as.is=T,quote="",comment.char="")
+	colnames(curfile)<-c("qseqid","sseqid","evalue","bitscore","sgi","sacc","staxids","sscinames","scomnames","stitle")
+	curfile_onecopy<-curfile[!duplicated(curfile[,1]),]
+	blastresults_clips[[i]]<-curfile_onecopy
+	blastresults_clips_nocutoff[[i]]<-curfile
+
+	if(file.exists(paste("blast_lq/",targets$alias[i],".blast.tsv",sep='')))
+	{
+		curfile<-read.table(paste("newblast_lq/",targets$alias[i],".blast.tsv",sep=''),sep='\t',header=F,as.is=T,quote="",comment.char="")
+		colnames(curfile)<-c("qseqid","sseqid","evalue","bitscore","sgi","sacc","staxids","sscinames","scomnames","stitle")
+		curfile_onecopy<-curfile[!duplicated(curfile[,1]),]
+		blastresults_lq[[i]]<-curfile_onecopy
+		blastresults_lq_nocutoff[[i]]<-curfile
+	}
+	else
+	{
+		blastresults_lq[[i]]<-NA
+		blastresults_lq_nocutoff[[i]]<-NA
+	}
+}
+names(blastresults)<-targets[,3]
+names(blastresults_nocutoff)<-targets[,3]
+
+names(blastresults_clips)<-targets[,3]
+names(blastresults_clips_nocutoff)<-targets[,3]
+
+names(blastresults_lq)<-targets[,3]
+names(blastresults_lq_nocutoff)<-targets[,3]
+
+saveRDS(blastresults,"blastresults.rds")
+saveRDS(blastresults_nocutoff,"blastresults_nocutoff.rds")
+saveRDS(blastresults_clips,"blastresults_clips.rds")
+saveRDS(blastresults_clips_nocutoff,"blastresults_clips_nocutoff.rds")
+saveRDS(blastresults_lq,"blastresults_lq.rds")
+saveRDS(blastresults_lq_nocutoff,"blastresults_lq_nocutoff.rds")
+
+pdf("barplots.pdf",height=8,width=11)
+for(i in 1:length(targets[,1]))
+{
+	table(blastresults[[i]]$scomnames)[table(blastresults[[i]]$scomnames) > 1]
+	temp<-table(blastresults[[i]]$scomnames)[table(blastresults[[i]]$scomnames) > 1]
+	par(mar=c(7,12,3,3))
+	barplot(temp[order(temp)],xlab="number of transcripts with best blast hit",horiz=T,las=2,main=targets$alias[i],cex.names=.8)
+
+	blastresults[[i]]$evalue
+}
+dev.off()
+
+pdf("barplots_clips.pdf",height=8,width=11)
+for(i in 1:length(targets[,1]))
+{
+	table(blastresults_clips[[i]]$scomnames)[table(blastresults_clips[[i]]$scomnames) > 1]
+	temp<-table(blastresults_clips[[i]]$scomnames)[table(blastresults_clips[[i]]$scomnames) > 1]
+	par(mar=c(7,14,3,3))
+	barplot(temp[order(temp)],xlab="number of transcripts with best blast hit",horiz=T,las=2,main=targets$alias[i],cex.names=.7)
+
+	blastresults_clips[[i]]$evalue
+}
+dev.off()
+
+
+pdf("barplots_lq.pdf",height=8,width=11)
+for(i in 1:length(targets[,1]))
+{
+	if(!is.na(blastresults_lq[[i]]) && length(table(blastresults_lq[[i]]$scomnames)[table(blastresults_lq[[i]]$scomnames) > 1]) > 0)
+	{
+		temp<-table(blastresults_lq[[i]]$scomnames)[table(blastresults_lq[[i]]$scomnames) > 1]
+		par(mar=c(7,12,3,3))
+		barplot(temp[order(temp)],xlab="number of transcripts with best blast hit",horiz=T,las=2,cex.names=.8,main=targets$alias[i])
+
+		blastresults_lq[[i]]$evalue
+	}
+}
+dev.off()
+
+evalue_ranges<-as.data.frame(lapply(blastresults,function(x){range(x$evalue)}))
+evalue_ranges_clips<-as.data.frame(lapply(blastresults_clips,function(x){range(x$evalue)}))
+evalue_ranges_lq<-as.data.frame(lapply(blastresults_lq,function(x){if(!is.na(x)){range(x$evalue)} else {c(0,0)}}))
+
+```
+
+We had varying numbers of high quality ccs transcripts for each sample:
+
+
+```{r,out.width="800px"}
+	knitr::include_graphics("../data/barplot_transcripts.png")
+```
+
+There were a very small number of low quality transcripts:
+
+```{r,out.width="800px"}
+	knitr::include_graphics("../data/barplot_transcripts_lq.png")
+```
+
+About 99% of hq transcripts aligned to human:
+
+```{r,out.width="800px"}
+	knitr::include_graphics("../data/barplot_alignments_pct.png")
+```
+
+From 53% to 100% of the low quality transcripts aligned to human:
+
+```{r,out.width="800px"}
+	knitr::include_graphics("../data/barplot_alignments_pct_lq.png")
+```
+
+The number of unmapped hq transcripts I started with for each sample ranged from 27 to 265, mean ~130 (after aligning to human genome with minimap2).
+
+```{r,out.width="800px"}
+	knitr::include_graphics("../data/barplot.png")  
+```
+
+The number of unmapped lq transcripts was less overall, from 0 to 85 (after aligning to human genome with minimap2).
+
+```{r,out.width="800px"}
+	knitr::include_graphics("../data/barplot_lq.png")  
+```
+
+The hq transcript length histograms for the non-human sequences (prior to blasting)
+
+[transcript_length_hist.pdf](http://webfs/n/core/Bioinformatics/analysis/Workman/tas/cbio.tas.104/data/transcript_length_hist.pdf)  
+
+The lq transcript length histograms for the non-human sequences (prior to blasting)
+
+[transcript_length_hist_lq.pdf](http://webfs/n/core/Bioinformatics/analysis/Workman/tas/cbio.tas.104/data/transcript_length_hist_lq.pdf)  
+
+
+Barplot showing number of transcripts whose best blast hit mapped to a given sequence - max e-value for hq transcripts here is 4.72e-06, so pretty small:
+
+max e-value for low-quality is .001. 
+
+The only pathogens I noticed were lots of Epstein-Barr virus and a little Staph aureus in tas1_total. The other species I'd assume to be human in origin and just matching due to sequencing errors and conservation.
+
+[barplots.pdf](http://webfs/n/core/Bioinformatics/analysis/Workman/tas/cbio.tas.104/data/barplots.pdf)  
+[barplots_lq.pdf](http://webfs/n/core/Bioinformatics/analysis/Workman/tas/cbio.tas.104/data/barplots_lq.pdf)  
+
+The raw blast results for each sample, hq:
+
+[tas10_total.blast.tsv](http://webfs/n/core/Bioinformatics/analysis/Workman/tas/cbio.tas.104/data/newblast_hq/tas1_total.blast.tsv)  
+[tas1_total.blast.tsv](http://webfs/n/core/Bioinformatics/analysis/Workman/tas/cbio.tas.104/data/newblast_hq/tas1_total.blast.tsv)  
+[tas20_total.blast.tsv](http://webfs/n/core/Bioinformatics/analysis/Workman/tas/cbio.tas.104/data/newblast_hq/tas20_total.blast.tsv)  
+[tas22_total.blast.tsv](http://webfs/n/core/Bioinformatics/analysis/Workman/tas/cbio.tas.104/data/newblast_hq/tas22_total.blast.tsv)  
+[tas2_total.blast.tsv](http://webfs/n/core/Bioinformatics/analysis/Workman/tas/cbio.tas.104/data/newblast_hq/tas2_total.blast.tsv)  
+[tas21_total.blast.tsv](http://webfs/n/core/Bioinformatics/analysis/Workman/tas/cbio.tas.104/data/newblast_hq/tas21_total.blast.tsv)  
+[tas23_total.blast.tsv](http://webfs/n/core/Bioinformatics/analysis/Workman/tas/cbio.tas.104/data/newblast_hq/tas23_total.blast.tsv)  
+[tas18_total.blast.tsv](http://webfs/n/core/Bioinformatics/analysis/Workman/tas/cbio.tas.104/data/newblast_hq/tas18_total.blast.tsv)  
+[tas11_total.blast.tsv](http://webfs/n/core/Bioinformatics/analysis/Workman/tas/cbio.tas.104/data/newblast_hq/tas11_total.blast.tsv)  
+[tas30_total.blast.tsv](http://webfs/n/core/Bioinformatics/analysis/Workman/tas/cbio.tas.104/data/newblast_hq/tas30_total.blast.tsv)  
+[tas19_total.blast.tsv](http://webfs/n/core/Bioinformatics/analysis/Workman/tas/cbio.tas.104/data/newblast_hq/tas19_total.blast.tsv)  
+[tas29_total.blast.tsv](http://webfs/n/core/Bioinformatics/analysis/Workman/tas/cbio.tas.104/data/newblast_hq/tas29_total.blast.tsv)  
+[tas10_mrna.blast.tsv](http://webfs/n/core/Bioinformatics/analysis/Workman/tas/cbio.tas.104/data/newblast_hq/tas10_mrna.blast.tsv)  
+[tas1_mrna.blast.tsv](http://webfs/n/core/Bioinformatics/analysis/Workman/tas/cbio.tas.104/data/newblast_hq/tas1_mrna.blast.tsv)  
+[tas20_mrna.blast.tsv](http://webfs/n/core/Bioinformatics/analysis/Workman/tas/cbio.tas.104/data/newblast_hq/tas20_mrna.blast.tsv)  
+[tas22_mrna.blast.tsv](http://webfs/n/core/Bioinformatics/analysis/Workman/tas/cbio.tas.104/data/newblast_hq/tas22_mrna.blast.tsv)  
+[tas2_mrna.blast.tsv](http://webfs/n/core/Bioinformatics/analysis/Workman/tas/cbio.tas.104/data/newblast_hq/tas2_mrna.blast.tsv)  
+[tas21_mrna.blast.tsv](http://webfs/n/core/Bioinformatics/analysis/Workman/tas/cbio.tas.104/data/newblast_hq/tas21_mrna.blast.tsv)  
+[tas23_mrna.blast.tsv](http://webfs/n/core/Bioinformatics/analysis/Workman/tas/cbio.tas.104/data/newblast_hq/tas23_mrna.blast.tsv)  
+[tas18_mrna.blast.tsv](http://webfs/n/core/Bioinformatics/analysis/Workman/tas/cbio.tas.104/data/newblast_hq/tas18_mrna.blast.tsv)  
+[tas11_mrna.blast.tsv](http://webfs/n/core/Bioinformatics/analysis/Workman/tas/cbio.tas.104/data/newblast_hq/tas11_mrna.blast.tsv)  
+[tas30_mrna.blast.tsv](http://webfs/n/core/Bioinformatics/analysis/Workman/tas/cbio.tas.104/data/newblast_hq/tas30_mrna.blast.tsv)  
+[tas19_mrna.blast.tsv](http://webfs/n/core/Bioinformatics/analysis/Workman/tas/cbio.tas.104/data/newblast_hq/tas19_mrna.blast.tsv)  
+[tas29_mrna.blast.tsv](http://webfs/n/core/Bioinformatics/analysis/Workman/tas/cbio.tas.104/data/newblast_hq/tas29_mrna.blast.tsv)  
+
+### Looking into softclipping
+
+We thought there might be a chance that a transcript was part human, part pathogen (if a pathogenic sequence was inserted into the human genome). 
+
+To look for this case, I read in all the bam files for the hq transcripts. These are all transcripts that aligned partially or fully to human with minimap2. I looked for regions that were soft or hard-clipped at the ends of transcripts (part of the transcript matches human genome, part doesn't). For clipping regions > 99 bases, I exported them to a fasta file and blasted them. There were between 80 and 300 of these per sample.
+
+``` {r softclipping, echo=TRUE, message=FALSE, results="hide", warning=FALSE, eval=FALSE}
+
+#read in bam file, look for big clipping (hard or soft)
+
+library(GenomicAlignments)
+library(Rsamtools)
+library(rtracklayer)
+library(ShortRead)
+library(seqinr)
+
+for(i in 1:length(targets$alias))
+{
+	three_digit_clips<-list()
+	seqs<-list()
+	k<-1
+	params<-ScanBamParam(flag=scanBamFlag(isSecondaryAlignment=FALSE),what=c("qname","flag","rname","seq","strand","pos","qwidth","cigar","qual","mapq"))
+	cur<-readGAlignments(paste("../code/minimap2_hq/",targets$alias[i],".sorted.bam",sep=''),param=params)
+
+	#read in fastq
+	fastq<-readFastq(paste(targets$path[i],targets$file[i],sep=''))
+	ids<-gsub(" .*","",as.character(id(fastq)))
+
+	#pull out some big clips
+
+	start_w_clip.iv<-grepl("^\\d+[HS]",cigar(cur))
+	end_w_clip.iv<-grepl("\\d+[HS]$",cigar(cur))
+	both.iv<-start_w_clip.iv & end_w_clip.iv
+	start_only.iv<-start_w_clip.iv & !both.iv
+	end_only.iv<-end_w_clip.iv & !both.iv
+	#73% of txs have a clip at the start or end...
+	for(j in 1:length(which(start_only.iv)))
+	{
+		first_clip<-regexpr("^\\d+",cigar(cur)[start_only.iv][j])
+		if(attr(first_clip,"match.length")>2)
+		{
+			numeric_match<-as.numeric(substr(cigar(cur)[start_only.iv][j],1,attr(first_clip,"match.length")))
+			three_digit_clips[[k]]<-cur[start_only.iv][j]
+			myseq<-as.character(sread(fastq[gsub(" .*","",as.character(id(fastq)))==mcols(three_digit_clips[[k]])$qname]))
+			seqs[[k]]<-substr(myseq,1,numeric_match)
+			k<-k+1
+		}
+	}
+	for(j in 1:length(which(end_only.iv)))
+	{
+		last_clip<-regexpr("(\\d+)[HS]$",cigar(cur)[end_only.iv][j])
+		if(attr(last_clip,"match.length")>3)
+		{
+			numeric_match<-as.numeric(gsub("[HS]$","",substr(cigar(cur)[end_only.iv][j],last_clip[1],last_clip[1]+attr(last_clip,"match.length"))))
+			three_digit_clips[[k]]<-cur[end_only.iv][j]
+			myseq<-as.character(sread(fastq[gsub(" .*","",as.character(id(fastq)))==mcols(three_digit_clips[[k]])$qname]))
+			seqs[[k]]<-substr(myseq,last_clip[1],numeric_match)
+			k<-k+1
+		}
+	}
+	for(j in 1:length(which(both.iv)))
+	{
+		first_clip<-regexpr("^\\d+",cigar(cur)[both.iv][j])
+		last_clip<-regexpr("(\\d+)[HS]$",cigar(cur)[both.iv][j])
+		if(attr(first_clip,"match.length")>2 | attr(last_clip,"match.length")>3)
+		{
+			numeric_match_start<-as.numeric(substr(cigar(cur)[both.iv][j],1,attr(first_clip,"match.length")))
+			numeric_match_end<-as.numeric(gsub("[HS]$","",substr(cigar(cur)[both.iv][j],last_clip[1],last_clip[1]+attr(last_clip,"match.length"))))
+			three_digit_clips[[k]]<-cur[both.iv][j]
+			myseq<-as.character(sread(fastq[gsub(" .*","",as.character(id(fastq)))==mcols(three_digit_clips[[k]])$qname]))
+			if(attr(first_clip,"match.length")>2)
+			{
+				seqs[[k]]<-substr(myseq,1,numeric_match_start)
+			}
+			else if(attr(last_clip,"match.length")>3)
+			{
+				seqs[[k]]<-substr(myseq,last_clip[1],numeric_match_end)
+			}
+			else
+			{
+				seqs[[k]]<-paste(substr(myseq,1,numeric_match_start),":",substr(myseq,last_clip[1],numeric_match_end),sep='')
+			}
+			k<-k+1
+		}
+	}
+	#write out a fasta file with txid and cigar string and clipped sequence
+	write.fasta(seqs,as.string=T,names=paste(unlist(lapply(three_digit_clips,function(x){mcols(x)$qname})),":",unlist(lapply(three_digit_clips,function(x){mcols(x)$cigar})),sep=''),file.out=paste(targets$alias[i],".clips.fa",sep=''),open="w")
+}
+```
+
+Barplot showing number of clipped regions whose best blast hit mapped to a given sequence - max e-value is 9.74e-05. Most of this just looks like misplaced human to me.
+
+[barplots_clips.pdf](http://webfs/n/core/Bioinformatics/analysis/Workman/tas/cbio.tas.104/data/barplots_clips.pdf)  
+
+### How many human genes had a transcript?
+
+``` {r gene counts, echo=TRUE, message=FALSE, results="hide", warning=FALSE, eval=FALSE}
+
+#tas22_mrna.sorted.coverage.txt
+
+genes<-list()
+genes_hist<-list()
+
+count_df<-data.frame(matrix(NA,ncol=1+length(targets$alias),nrow=60623))
+d<-read.table(paste("../code/minimap2_hq/",targets$alias[1],".sorted.coverage.all.txt",sep=''),sep='\t',as.is=T,header=F)
+count_df[,1]<-d[,4]
+
+for(i in 1:length(targets$alias))
+{
+	d<-read.table(paste("../code/minimap2_hq/",targets$alias[i],".sorted.coverage.all.txt",sep=''),sep='\t',as.is=T,header=F)
+	j<-i+1
+	count_df[,j]<-d[match(d[,4],count_df[,1]),7]
+	genes[[i]]<-length(which(d[,7]>0))
+	genes_hist[[i]]<-d[,7]
+	names(genes_hist[[i]])<-d[,4]
+}
+
+colnames(count_df)<-c("ensid",targets$alias)
+source("/n/projects/mcm/R/utilities/corplot.R")
+png("corplot.counts.png",height=800,width=1000)
+corplotd(count_df[,2:length(count_df[1,])])
+dev.off()
+
+temp<-do.call("c",genes_hist)
+tempdf<-data.frame(ensid=names(genes_hist[[1]]),count=temp,alias=rep(targets$alias,each=60623))
+tempdf$log2<-log2(tempdf$count)
+nonzero<-tempdf[tempdf$count > 0,]
+ggplot(tempdf,aes(x=log2,y=alias,fill=alias)) + geom_density_ridges(jittered_points=TRUE, position=position_points_jitter(width=.05,height=0),point_shape='|',point_size=3,point_alpha=1,alpha=0.7) + theme_ridges() + theme(legend.position = "none")
+
+png("ridgeline_nonzero_counts.all.png",height=1200,width=800)
+gp<-ggplot(nonzero,aes(x=count,y=alias,fill=alias)) + geom_density_ridges(scale=1,jittered_points=TRUE, position=position_points_jitter(width=.05,height=0),point_shape='|',point_size=1,point_alpha=1,alpha=0.7) + theme_ridges() + theme(legend.position = "none")
+print(gp)
+dev.off()
+
+png("ridgeline_nonzero_counts.all.zoom.png",height=1200,width=800)
+gp<-ggplot(nonzero,aes(x=count,y=alias,fill=alias)) + geom_density_ridges(scale=1,jittered_points=TRUE, position=position_points_jitter(width=.05,height=0),point_shape='|',point_size=1,point_alpha=1,alpha=0.7) + theme_ridges() + theme(legend.position = "none") + xlim(c(0,150))
+print(gp)
+dev.off()
+
+
+png("barplot_human_gene_counts.all.png",height=600,width=800)
+par(mar=c(8,4,3,3))
+barplot(unlist(genes),col=cols,names.arg=targets$alias,main="Number of human genes with any pacbio transcripts overlapping",las=2,ylim=c(0,20000))
+dev.off()
+
+genedata<-read.table("/n/data1/genomes/indexes/hg38/annotation/Ens_98/tables/hg38.Ens_98.gene_data.txt",sep='\t',header=T,quote="",comment.char="")
+
+#correlation matrix for the human data
+```
+
+To get an idea of the level of coverage we were getting, Hua suggested quantifying the level of coverage of human genes. If pathogens are present at a very low level compared to the human sequences, this might give us a feel for how deeply we have sequenced and whether more sequencing may help.
+
+Using bedtools coverage, I calculated the coverage on all human protein coding genes for each sample. This barplot shows how many human genes (out of 20,426 protein coding in Ensembl 98) had 1 or more counts from the pacbio hq transcripts. That's about 43 percent of genes that have any coverage (for the median).
+
+```{r,out.width="800px"}
+	knitr::include_graphics("../data/barplot_human_gene_counts.png")  
+```
+
+Overall, the counts on genes are quite low (90 percent of the genes have 5 or fewer counts) and maxes out at 132 (for IGHM in tas11 (healthy female mRNA sample)).
+
+```{r,out.width="800px"}
+	knitr::include_graphics("../data/ridgeline_nonzero_counts.png")
+```
+
+Then I also checked using all annotated genes, including ncRNAs. Now there are 60,623 annotated genes. Most samples found counts on ~15,000 genes.
+
+```{r,out.width="800px"}
+	knitr::include_graphics("../data/barplot_human_gene_counts.all.png")  
+```
+
+Overall, the counts on all (inc ncRNA) genes are quite low (90 percent of the genes have 5 or fewer counts) but maxes out much higher than pc genes. A lncRNA in tas20 totalRNA has 1432 counts, but it seems high in other samples too.
+
+```{r,out.width="800px"}
+	knitr::include_graphics("../data/ridgeline_nonzero_counts.all.png")
+```
+
+Zoomed in:
+
+```{r,out.width="800px"}
+	knitr::include_graphics("../data/ridgeline_nonzero_counts.all.zoom.png")
+```
+
+
+```{r dge analysis, echo=TRUE, message=FALSE, results="hide", warning=FALSE, eval=FALSE}
+library(edgeR)
+lengths<-genedata[,c("Gene_ID","Exonic_Len")]
+
+normCounts<-data.frame(matrix(NA,nrow=length(count_df[,1]),ncol=length(samples)))
+edger.rpkm<-data.frame(matrix(NA,nrow=length(count_df[,1]),ncol=length(samples)))
+
+#wild type are tas10, 23 (healthy male), tas11, 22, 30 (healthy female)
+targets$group<-"dis_total"
+targets$group[targets$alias %in% c("tas10_total", "tas22_total", "tas23_total", "tas11_total", "tas30_total")]<-"wt_total"
+targets$group[targets$alias %in% c("tas10_mrna", "tas22_mrna", "tas23_mrna", "tas11_mrna", "tas30_mrna")]<-"wt_mrna"
+targets$group[targets$alias %in% c("tas1_mrna", "tas20_mrna", "tas2_mrna", "tas21_mrna", "tas18_mrna", "tas19_mrna", "tas29_mrna")]<-"dis_mrna"
+
+rownames(count_df)<-count_df[,1]
+y <- DGEList(counts=count_df[,2:length(count_df[1,])],group=targets$group)
+y <- calcNormFactors(y)
+
+normCounts<-cpm(y, normalized.lib.sizes=TRUE)
+colnames(normCounts)<-paste("cpm.",targets$alias,sep='')
+
+temp<-log2(normCounts)
+finite.iv<-apply(temp,2,is.finite)
+temp[!finite.iv]<-NA
+log2normCounts<-temp
+
+png("corplot.log2normcounts.png",height=800,width=1000)
+cors<-corplotd(log2normCounts)
+dev.off()
+
+png("corplot.log2normcounts.clust.png",height=800,width=1000)
+pheatmap(cors)
+dev.off()
+
+corplotd(normCounts)
+
+temp<-log2normCounts
+rownames(temp)<-paste(rownames(temp)," (",genedata[match(rownames(log2normCounts),genedata[,1]),2],")",sep='')
+temp[is.na(temp)]<-0
+
+pdf("heatmap_top50_mean.pdf",height=10,width=10)
+pheatmap(temp[rev(order(rowMeans(temp))),][1:50,],fontsize_row=5,scale="row")
+dev.off()
+
+temp<-log2normCounts
+temp[is.na(temp)]<-0
+sds<-apply(temp,1,sd)
+rownames(temp)<-paste(rownames(temp)," (",genedata[match(rownames(log2normCounts),genedata[,1]),2],")",sep='')
+
+sds[head(rev(order(sds,na.last=F)))]
+
+neword<-c("cpm.tas10_mrna","cpm.tas10_total","cpm.tas23_mrna","cpm.tas23_total","cpm.tas1_mrna","cpm.tas1_total","cpm.tas18_mrna",
+"cpm.tas18_total","cpm.tas20_mrna","cpm.tas20_total","cpm.tas11_mrna","cpm.tas11_total","cpm.tas22_mrna","cpm.tas22_total",
+"cpm.tas30_mrna","cpm.tas30_total","cpm.tas2_mrna","cpm.tas2_total","cpm.tas19_mrna","cpm.tas19_total","cpm.tas21_mrna",
+"cpm.tas21_total","cpm.tas29_mrna","cpm.tas29_total")
+
+pdf("heatmap_top50_sd.pdf",height=10,width=10)
+pheatmap(temp[rev(order(sds)),][1:50,],fontsize_row=5)
+dev.off()
+
+pdf("heatmap_top50_sd.reord.pdf",height=10,width=10)
+pheatmap(temp[rev(order(sds)),][1:50,],fontsize_row=5)
+dev.off()
+
+lengths<-genedata[,c("Gene_ID","Exonic_Len")]
+normCounts<-data.frame(matrix(NA,nrow=length(ccs_nz[,1]),ncol=length(samples)))
+
+rownames(ccs_nz)<-ccs_nz[,1]
+y <- DGEList(counts=ccs_nz[,2:length(ccs_nz[1,])],group=targets$alias)
+keep.iv <- filterByExpr(y,min.count=1,min.total.count=3,min.prop=0)
+y <- y[keep.iv, , keep.lib.sizes=FALSE]
+y <- calcNormFactors(y)
+
+normCounts<-cpm(y, normalized.lib.sizes=TRUE)
+colnames(normCounts)<-paste("cpm.",targets$alias,sep='')
+
+temp<-log2(normCounts)
+finite.iv<-apply(temp,2,is.finite)
+temp[!finite.iv]<-NA
+log2normCounts<-temp
+
+png("corplot.log2normcounts.ccs.png",height=800,width=1000)
+cors<-corplotd(log2normCounts)
+dev.off()
+
+png("corplot.log2normcounts.clust.ccs.png",height=800,width=1000)
+pheatmap(cors)
+dev.off()
+
+temp<-log2normCounts
+rownames(temp)<-paste(rownames(temp)," (",genedata[match(rownames(log2normCounts),genedata[,1]),2],")",sep='')
+temp[is.na(temp)]<-0
+
+pdf("heatmap_top50_mean.ccs.pdf",height=10,width=10)
+pheatmap(temp[rev(order(rowMeans(temp))),][1:50,],fontsize_row=5,scale="row")
+dev.off()
+
+temp<-log2normCounts
+temp[is.na(temp)]<-0
+sds<-apply(temp,1,sd)
+rownames(temp)<-paste(rownames(temp)," (",genedata[match(rownames(log2normCounts),genedata[,1]),2],")",sep='')
+
+sds[head(rev(order(sds,na.last=F)))]
+
+pdf("heatmap_top50_sd.ccs.pdf",height=10,width=10)
+pheatmap(temp[rev(order(sds)),][1:50,],fontsize_row=5)
+dev.off()
+
+#rrna
+
+par(mar=c(10,3,3,1))
+barplot(log2normCounts[rownames(log2normCounts)=="ENSG00000275757",],las=2,col=cols,main="ENSG00000275757 (5_8S_rRNA)")
+
+par(mar=c(10,3,3,1))
+barplot(log2normCounts[rownames(log2normCounts)=="ENSG00000229807",],las=2,col=cols,main="ENSG00000229807 (XIST)")
+
+#bedtools version
+normCounts<-data.frame(matrix(NA,nrow=length(ccs_bt_nz[,1]),ncol=length(targets$alias)+1))
+
+rownames(ccs_bt_nz)<-ccs_bt_nz[,1]
+y <- DGEList(counts=ccs_bt_nz[,2:length(ccs_bt_nz[1,])],group=targets$alias)
+keep.iv <- filterByExpr(y,min.count=1,min.total.count=3,min.prop=0)
+y <- y[keep.iv, , keep.lib.sizes=FALSE]
+y <- calcNormFactors(y)
+
+normCounts<-cpm(y, normalized.lib.sizes=TRUE)
+colnames(normCounts)<-paste("cpm.",targets$alias,sep='')
+
+temp<-log2(normCounts)
+finite.iv<-apply(temp,2,is.finite)
+temp[!finite.iv]<-NA
+log2normCounts<-temp
+
+png("corplot.log2normcounts.ccs.bt.png",height=800,width=1000)
+cors<-corplotd(log2normCounts)
+dev.off()
+
+png("corplot.log2normcounts.clust.ccs.bt.png",height=800,width=1000)
+pheatmap(cors)
+dev.off()
+
+temp<-log2normCounts
+rownames(temp)<-paste(rownames(temp)," (",genedata[match(rownames(log2normCounts),genedata[,1]),2],")",sep='')
+temp[is.na(temp)]<-0
+
+pdf("heatmap_top50_mean.ccs.bt.pdf",height=10,width=10)
+pheatmap(temp[rev(order(rowMeans(temp))),][1:50,],fontsize_row=5,scale="row")
+dev.off()
+
+temp<-log2normCounts
+temp[is.na(temp)]<-0
+sds<-apply(temp,1,sd)
+rownames(temp)<-paste(rownames(temp)," (",genedata[match(rownames(log2normCounts),genedata[,1]),2],")",sep='')
+
+sds[head(rev(order(sds,na.last=F)))]
+
+pdf("heatmap_top50_sd.ccs.bt.pdf",height=10,width=10)
+pheatmap(temp[rev(order(sds)),][1:50,],fontsize_row=5)
+dev.off()
+
+
+#sqanti2 version
+source("/n/projects/mcm/R/utilities/corplot.R")
+normCounts<-data.frame(matrix(NA,nrow=length(sq.at_least_two[,1]),ncol=length(targets$alias)+1))
+
+
+#wild type are tas10, 23 (healthy male), tas11, 22, 30 (healthy female)
+targets$group<-"dis_total"
+targets$group[targets$alias %in% c("tas10_total", "tas22_total", "tas23_total", "tas11_total", "tas30_total")]<-"wt_total"
+targets$group[targets$alias %in% c("tas10_mrna", "tas22_mrna", "tas23_mrna", "tas11_mrna", "tas30_mrna")]<-"wt_mrna"
+targets$group[targets$alias %in% c("tas1_total", "tas20_total", "tas2_total", "tas21_total", "tas18_total", "tas19_total", "tas29_total")]<-"dis_mrna"
+
+
+reord_targets<-targets[match(c("tas10_total","tas23_total","tas11_total","tas22_total","tas30_total","tas1_total","tas20_total","tas2_total","tas21_total","tas18_total","tas19_total","tas29_total","tas10_mrna","tas23_mrna","tas11_mrna","tas22_mrna","tas30_mrna","tas1_mrna","tas20_mrna","tas2_mrna","tas21_mrna","tas18_mrna","tas19_mrna","tas29_mrna"),targets$alias),]
+temp<-sq.at_least_two[,c("gene",reord_targets$alias)]
+
+rownames(sq.at_least_two)<-sq.at_least_two[,1]
+y <- DGEList(counts=temp[,2:length(temp[1,])],group=reord_targets$group)
+keep.iv <- filterByExpr(y,min.count=1,min.total.count=3,min.prop=0)
+y <- y[keep.iv, , keep.lib.sizes=FALSE]
+y <- calcNormFactors(y)
+
+normCounts<-cpm(y, normalized.lib.sizes=TRUE)
+colnames(normCounts)<-paste("cpm.",reord_targets$alias,sep='')
+
+temp<-log2(normCounts)
+finite.iv<-apply(temp,2,is.finite)
+temp[!finite.iv]<-NA
+log2normCounts<-temp
+
+png("corplot.log2normcounts.sq.png",height=800,width=1000)
+cors<-corplotd(log2normCounts)
+dev.off()
+
+png("corplot.log2normcounts.clust.sq.png",height=800,width=1000)
+pheatmap(cors)
+dev.off()
+
+groups<-reord_targets$group
+design <- model.matrix(~0+groups, data=y$samples)
+colnames(design)<-levels(y$samples$group)
+
+y<-estimateDisp(y,design)
+normCounts<-cpm(y,normalized.lib.sizes=T)
+colnames(normCounts)<-paste("cpm.",reord_targets$alias,sep='')
+
+fit <- glmQLFit(y,design)
+
+dis_v_healthy_total<-c(0,1,0,-1)
+dis_v_healthy_mrna<-c(1,0,-1,0)
+
+res<-list()
+res[[1]]<-glmQLFTest(fit,contrast=dis_v_healthy_total)
+res[[2]]<-glmQLFTest(fit,contrast=dis_v_healthy_mrna)
+conts<-c("dis_v_healthy_total","dis_v_healthy_mrna")
+
+#adjust p-values
+for(i in 1:length(conts))
+{
+   res[[i]]$table$padj<-p.adjust(res[[i]]$table$PValue,method="BH")
+}
+
+summarytable<-data.frame(round(normCounts),res[[1]]$table[,2],res[[1]]$table[,c(1,4,5)],res[[2]]$table[,c(1,4,5)])
+rownames(summarytable)<-rownames(y$counts)
+colnames(summarytable)[25]<-"logCPM"
+colnames(summarytable)[26:length(summarytable[1,])]<-paste(c(paste(rep(conts,each=3),rep(c(".log2fc",".pval",".padj"),times=2),sep='')))
+
+#add annotation to summary table
+summarytable_ann<-data.frame(sq_id=rownames(summarytable),genedata[match(rownames(summarytable),genedata[,2]),c("Gene_ID","Name","Chrom", "Start", "End", "Strand", "Biotype","Description")],summarytable[,1:length(summarytable[1,])])
+rownames(summarytable_ann)<-summarytable_ann$Name
+summarytable_ann.sort<-summarytable_ann[order(summarytable_ann[,"dis_v_healthy_total.padj"]),]
+write.table(summarytable_ann.sort,"summary_genes.tsv",sep='\t',quote=F,row.names=F)
+system("cp summary_genes.tsv ../results")
+
+
+#de up and down genes
+system("mkdir ../results/DE")
+ups<-list()
+dns<-list()
+for(i in 1:length(conts))
+{
+   iv.up<-summarytable_ann.sort[,paste(conts[i],".pval",sep='')] < .1 & summarytable_ann.sort[,paste(conts[i],".log2fc",sep='')] >= 0.5849625
+   iv.dn<-summarytable_ann.sort[,paste(conts[i],".pval",sep='')] < .1 & summarytable_ann.sort[,paste(conts[i],".log2fc",sep='')] <= -0.5849625 
+   ups[[i]]<-iv.up
+   dns[[i]]<-iv.dn
+   write.table(summarytable_ann.sort[iv.up,],paste("../results/DE/",conts[i],".de.up.xls",sep=''),sep='\t',quote=F,row.names=F)
+   write.table(summarytable_ann.sort[iv.dn,],paste("../results/DE/",conts[i],".de.dn.xls",sep=''),sep='\t',quote=F,row.names=F)
+}
+names(ups)<-names(dns)<-conts
+saveRDS(ups,"ups.Rds")
+saveRDS(dns,"dns.Rds")
+saveRDS(groups,"groups.Rds")
+
+png("maplots.png",height=600,width=1200,pointsize=16)
+par(mfrow=c(1,2))
+plot(summarytable_ann.sort$logCPM,summarytable_ann.sort$dis_v_healthy_total.log2fc,xlab="dis_v_healthy_total log2(cpm)",ylab="dis_v_healthy_total log2(fc)",main="MA plot, dis_v_healthy_total",ylim=c(-15,15))
+points(summarytable_ann.sort$logCPM[ups[[1]]],summarytable_ann.sort$dis_v_healthy_total.log2fc[ups[[1]]],col="#D95F02")
+points(summarytable_ann.sort$logCPM[dns[[1]]],summarytable_ann.sort$dis_v_healthy_total.log2fc[dns[[1]]],col="#7570B3")
+plot(summarytable_ann.sort$logCPM,summarytable_ann.sort$dis_v_healthy_mrna.log2fc,xlab="dis_v_healthy_mrna log2(cpm)",ylab="dis_v_healthy_mrna log2(fc)",main="MA plot, dis_v_healthy_mrna",ylim=c(-15,  15))
+points(summarytable_ann.sort$logCPM[ups[[2]]],summarytable_ann.sort$dis_v_healthy_mrna.log2fc[ups[[2]]],col="#D95F02")
+points(summarytable_ann.sort$logCPM[dns[[2]]],summarytable_ann.sort$dis_v_healthy_mrna.log2fc[dns[[2]]],col="#7570B3")
+dev.off()
+
+
+temp<-log2normCounts
+rownames(temp)<-paste(rownames(temp)," (",genedata[match(rownames(log2normCounts),genedata[,2]),1],")",sep='')
+temp[is.na(temp)]<-0
+
+pdf("heatmap_top50_mean.sq.pdf",height=10,width=10)
+pheatmap(temp[rev(order(rowMeans(temp))),][1:50,],fontsize_row=5,scale="row")
+dev.off()
+
+temp<-log2normCounts
+temp[is.na(temp)]<-0
+sds<-apply(temp,1,sd)
+rownames(temp)<-paste(rownames(temp)," (",genedata[match(rownames(log2normCounts),genedata[,2]),1],")",sep='')
+
+sds[head(rev(order(sds,na.last=F)))]
+
+pdf("heatmap_top50_sd.sq.pdf",height=10,width=10)
+pheatmap(temp[rev(order(sds)),][1:50,],fontsize_row=5)
+dev.off()
+
+neword<-c("cpm.tas10_mrna","cpm.tas10_total","cpm.tas23_mrna","cpm.tas23_total","cpm.tas1_mrna","cpm.tas1_total","cpm.tas18_mrna",
+"cpm.tas18_total","cpm.tas20_mrna","cpm.tas20_total","cpm.tas11_mrna","cpm.tas11_total","cpm.tas22_mrna","cpm.tas22_total",
+"cpm.tas30_mrna","cpm.tas30_total","cpm.tas2_mrna","cpm.tas2_total","cpm.tas19_mrna","cpm.tas19_total","cpm.tas21_mrna",
+"cpm.tas21_total","cpm.tas29_mrna","cpm.tas29_total")
+
+pdf("heatmap_top50_sd.sq.reord.pdf",height=10,width=10)
+pheatmap(temp[rev(order(sds)),][1:50,neword],fontsize_row=5,cluster_cols=F)
+dev.off()
+
+#rrna sq
+pdf("indiv_genes.sq.pdf")
+par(mar=c(10,3,3,1))
+barplot(log2normCounts[rownames(log2normCounts)=="XIST",],las=2,col=cols,main="ENSG00000229807 (XIST)")
+dev.off()
+
+goi<-c("XIST","TSIX","FTX","JPX","TSX","","FMR1","KDM5C","ATRX")
+pdf("indiv_genes.sq.pdf")
+for(i in 1:length(goi))
+{
+	par(mar=c(10,3,3,1))
+	if(length(grep(goi[i],rownames(log2normCounts))) > 0)
+	{
+		barplot(log2normCounts[rownames(log2normCounts)==goi[i],],las=2,col=cols,main=goi[i])
+	}
+}
+dev.off()
+
+
+#rrna
+
+pdf("indiv_genes.ccs.bt.pdf")
+par(mar=c(10,3,3,1))
+barplot(log2normCounts[rownames(log2normCounts)=="ENSG00000275757",],las=2,col=cols,main="ENSG00000275757 (5_8S_rRNA)")
+par(mar=c(10,3,3,1))
+barplot(log2normCounts[rownames(log2normCounts)=="ENSG00000229807",],las=2,col=cols,main="ENSG00000229807 (XIST)")
+dev.off()
+
+
+```
+
+### Edger results
+
+There is a summary table from the edgeR analysis here. To look for DE genes, I compared tas10, tas23, tas11, tas22, and tas30 to the rest of the samples separately for totalRNA and mRNA. No DE genes were found at 2-fold and adjusted p-value of .05, or at 1.5-fold and .1 adjusted p-value. So I set the fold change to 1.5 and used an unadjusted p-value of .1, just to get some genes to look at.
+
+(summary_genes.tsv)[http://webfs/n/core/Bioinformatics/analysis/Workman/tas/cbio.tas.104/data/summary_genes.tsv]
+
+MA plots:
+
+```{r,out.width="1200px"}
+knitr::include_graphics("../data/maplots.png")
+```
+
+GO analysis
+
+```{r GO analysis, echo=TRUE, message=FALSE, results="hide", warning=FALSE, eval=FALSE}
+source("../code/go_analysis.R")
+```
+
+
+### Correlations and Heatmaps
+
+Correlation matrix between samples (log2norm ccs counts).
+
+```{r,out.width="800px"}
+knitr::include_graphics("../data/corplot.log2normcounts.ccs.png")
+```
+
+Hierarchical clustering of correlation matrix, log2norm ccs counts
+
+```{r,out.width="800px"}
+knitr::include_graphics("../data/corplot.log2normcounts.clust.ccs.png")
+```
+
+Heatmap showing the top 50 mean log2norm ccs count genes across all datasets. Row scaled.
+
+[heatmap_top50_mean.pdf](http://webfs/n/core/Bioinformatics/analysis/Workman/tas/cbio.tas.104/data/heatmap_top50_mean.ccs.pdf)
+
+Heatmap showing the top 50 standard deviation log2norm ccs count genes across datasets. No row scaling.
+
+[heatmap_top50_sd.pdf](http://webfs/n/core/Bioinformatics/analysis/Workman/tas/cbio.tas.104/data/heatmap_top50_sd.ccs.pdf)
+
+
+Same stuff, but with bedtools intersect instead of featureCounts
+Correlation matrix between samples (log2norm ccs counts).
+
+```{r,out.width="800px"}
+knitr::include_graphics("../data/corplot.log2normcounts.ccs.png")
+```
+
+Hierarchical clustering of correlation matrix, log2norm ccs counts
+
+```{r,out.width="800px"}
+knitr::include_graphics("../data/corplot.log2normcounts.clust.ccs.png")
+```
+
+Heatmap showing the top 50 mean log2norm ccs count genes across all datasets. Row scaled.
+
+[heatmap_top50_mean.pdf](http://webfs/n/core/Bioinformatics/analysis/Workman/tas/cbio.tas.104/data/heatmap_top50_mean.ccs.pdf)
+
+Heatmap showing the top 50 standard deviation log2norm ccs count genes across datasets. No row scaling.
+
+[heatmap_top50_sd.pdf](http://webfs/n/core/Bioinformatics/analysis/Workman/tas/cbio.tas.104/data/heatmap_top50_sd.ccs.pdf)
+
+
+### Sqanti2
+
+Same stuff, but with sqanti2 counts
+
+Correlation matrix between samples (log2norm counts).
+
+```{r,out.width="800px"}
+knitr::include_graphics("../data/corplot.log2normcounts.sq.png")
+```
+
+Hierarchical clustering of correlation matrix, log2norm counts
+
+```{r,out.width="800px"}
+knitr::include_graphics("../data/corplot.log2normcounts.clust.sq.png")
+```
+
+Heatmap showing the top 50 mean log2norm sqanti2 count genes across all datasets. Row scaled.
+
+[heatmap_top50_mean.sq.pdf](http://webfs/n/core/Bioinformatics/analysis/Workman/tas/cbio.tas.104/data/heatmap_top50_mean.sq.pdf)
+
+Heatmap showing the top 50 standard deviation log2norm count genes across datasets. No row scaling.
+
+[heatmap_top50_sd.sq.pdf](http://webfs/n/core/Bioinformatics/analysis/Workman/tas/cbio.tas.104/data/heatmap_top50_sd.sq.pdf)
+
+Barplots of the log2 normalized counts of a few genes of interest from Tamaki. Some genes were not found in the data.
+
+[indiv_genes.sq.pdf](https://webfs/n/core/Bioinformatics/analysis/Workman/tas/cbio.tas.104/data/indiv_genes.sq.pdf)
+
+GO enrichment analysis
+
+I used a hypergeometric test in R to look for enriched GO terms in the up and down gene lists:
+
+[go_barplots.pdf](https://webfs/n/core/Bioinformatics/analysis/Workman/tas/cbio.tas.104/data/go_barplots.pdf)
+
+Tables with all go term details:
+
+[GO](http://webfs/n/core/Bioinformatics/analysis/Workman/tas/cbio.tas.104/results/GO)
+
+
+KEGG pathways
+
+```{r kegg analysis, echo=TRUE, message=FALSE, results="hide", warning=FALSE, eval=FALSE}
+library(SPIA)
+library("org.Hs.eg.db")
+
+all_ent<-mapIds(org.Hs.eg.db,as.character(summarytable_ann.sort[,2]),'ENTREZID','ENSEMBL')
+all_ent<-all_ent[!is.na(all_ent)]
+spia_res.up<-list()
+spia_res.dn<-list()
+for(i in 1:length(ups))
+{
+   #ups
+   cur_ent<-mapIds(org.Hs.eg.db,as.character(summarytable_ann.sort[ups[[i]],2]),'ENTREZID','ENSEMBL',multiVals="first")
+   tempdf<-data.frame(names(cur_ent)[!is.na(names(cur_ent))],unlist(cur_ent))
+   cur_ent<-unique(cur_ent[!is.na(cur_ent)])
+   names(cur_ent)<-tempdf[match(cur_ent,tempdf[,2]),1]
+   logfc<-summarytable_ann.sort[match(names(cur_ent),summarytable_ann.sort[,2]),paste(conts[i],".log2fc",sep='')]
+   names(logfc)<-cur_ent
+   if(length(logfc)>0)
+   {
+      spia_res.up[[i]]<-spia(de=logfc,all=all_ent,organism="hsa",nB=2000,plots=TRUE)
+      write.table(spia_res.up[[i]],paste(conts[i],".spia.up.xls",sep=''),sep='\t',row.names=F,quote=F)
+   }
+
+   #dns
+   cur_ent<-mapIds(org.Hs.eg.db,as.character(summarytable_ann.sort[dns[[i]],2]),'ENTREZID','ENSEMBL',multiVals="first")
+   tempdf<-data.frame(names(cur_ent)[!is.na(names(cur_ent))],unlist(cur_ent))
+   cur_ent<-unique(cur_ent[!is.na(cur_ent)])
+   names(cur_ent)<-tempdf[match(cur_ent,tempdf[,2]),1]
+   logfc<-summarytable_ann.sort[match(names(cur_ent),summarytable_ann.sort[,2]),paste(conts[i],".log2fc",sep='')]
+   names(logfc)<-cur_ent
+   if(length(logfc)>0)
+   {
+      spia_res.dn[[i]]<-spia(de=logfc,all=all_ent,organism="hsa",nB=2000,plots=TRUE)
+      write.table(spia_res.dn[[i]],paste(conts[i],".spia.dn.xls",sep=''),sep='\t',row.names=F,quote=F)
+   }
+}
+
+#do with ups and downs together.
+all_ent<-mapIds(org.Hs.eg.db,as.character(summarytable_ann.sort[,2]),'ENTREZID','ENSEMBL')
+all_ent<-all_ent[!is.na(all_ent)]
+spia_res.de<-list()
+for(i in 1:length(ups))
+{
+   #ups
+   cur_ent<-mapIds(org.Hs.eg.db,as.character(summarytable_ann.sort[(ups[[i]] | dns[[i]]),2]),'ENTREZID','ENSEMBL',multiVals="first")
+   tempdf<-data.frame(names(cur_ent)[!is.na(names(cur_ent))],unlist(cur_ent))
+   cur_ent<-unique(cur_ent[!is.na(cur_ent)])
+   names(cur_ent)<-tempdf[match(cur_ent,tempdf[,2]),1]
+   logfc<-summarytable_ann.sort[match(names(cur_ent),summarytable_ann.sort[,2]),paste(conts[i],".log2fc",sep='')]
+   names(logfc)<-cur_ent
+   if(length(logfc)>0)
+   {
+      spia_res.de[[i]]<-spia(de=logfc,all=all_ent,organism="hsa",nB=2000,plots=TRUE)
+      write.table(spia_res.de[[i]],paste(conts[i],".spia.de.xls",sep=''),sep='\t',row.names=F,quote=F)
+   }
+}
+
+#IGV links
+selected<- c("tas11_mrna","tas11_total","tas22_mrna","tas22_total","tas30_mrna","tas30_total","tas2_mrna","tas2_total","tas19_mrna","tas19_total","tas21_mrna","tas21_total","tas29_mrna","tas29_total","tas10_mrna","tas10_total","tas18_mrna","tas18_total")
+
+cat(paste("https://webfs/n/core/Bioinformatics/analysis/Workman/tas/cbio.tas.104/code/minimap2_hq/",selected,".sorted.bam\n",sep=''))
+cat(paste("https://webfs/n/core/Bioinformatics/analysis/Workman/tas/cbio.tas.104/code/cupcake/",selected,".collapsed.gff\n",sep=''))
+```
+
+[dis_v_healthy_total.spia.up.xls](http://webfs/n/core/Bioinformatics/analysis/Workman/tas/cbio.tas.104/data/dis_v_healthy_total.spia.up.xls)
+[dis_v_healthy_total.spia.dn.xls](http://webfs/n/core/Bioinformatics/analysis/Workman/tas/cbio.tas.104/data/dis_v_healthy_total.spia.dn.xls)
+
+[dis_v_healthy_mrna.spia.up.xls](http://webfs/n/core/Bioinformatics/analysis/Workman/tas/cbio.tas.104/data/dis_v_healthy_mrna.spia.up.xls)
+[dis_v_healthy_mrna.spia.dn.xls](http://webfs/n/core/Bioinformatics/analysis/Workman/tas/cbio.tas.104/data/dis_v_healthy_mrna.spia.dn.xls)
+
+Up and Down combined:
+
+[dis_v_healthy_total.spia.de.xls](http://webfs/n/core/Bioinformatics/analysis/Workman/tas/cbio.tas.104/data/dis_v_healthy_total.spia.de.xls)
+[dis_v_healthy_mrna.spia.de.xls](http://webfs/n/core/Bioinformatics/analysis/Workman/tas/cbio.tas.104/data/dis_v_healthy_mrna.spia.de.xls)
+
+### Line plots
+
+Line plots of normalized coverage over the gene body for selected genes. To compare disease samples to average healthy samples.
+
+```{r line plots, echo=TRUE, message=FALSE, results="hide", warning=FALSE, eval=FALSE}
+#maybe try reading in the cupcake gffs instead of the minimap2 hq bams? Or try both ways. I guess the cupcake gffs don't consider abundance, but maybe I can get that from the abundance files, norm_fl. and use as a weight in coverage calculation?
+
+chromlen<-read.table("/n/data1/genomes/indexes/hg38/hg38.fa.fai",as.is=T)
+colnames(chromlen)<-c("chrom","length")
+endcheck <- function(chrom,val)
+{
+   #if start is less than 0 return 0
+   if(val < 1)
+   {     
+      ret <- 1;
+   }  
+   #if end is past end of chrom return end of chrom
+   else if(chromlen[chromlen[,1]==chrom,"length"] < val)
+   {
+      ret <- chromlen[chromlen[,1]==chrom,"length"];
+   }     
+   else  
+   {  
+      ret<-val
+   }
+   return(ret);
+}
+
+
+bed<-read.table("/n/data1/genomes/indexes/hg38/annotation/Ens_98/beds/hg38.Ens_98.genes.bed",sep='\t',header=F,quote="",comment.char="")
+colnames(bed)<-c("chrom","start.gene","end.gene","ensid","score","strand.gene")
+selected<-c("XIST","TSIX","ERAP2","PAIC2","HIST2H2AA4","KDM5C","PAICS")
+#couldn't find paic2
+ensids<-genedata[genedata[,2] %in% selected,1]
+goi<-bed[bed[,4] %in% ensids,]
+
+library(rtracklayer)
+library(GenomicAlignments)
+avgs<-list()
+avgs_gff<-list()
+for(i in 1:length(targets[,1]))
+{
+	avgs[[i]]<-data.frame(matrix(nrow=length(goi[,1]),ncol=81))
+	avgs[[i]][,1]<-goi[,4]
+
+	avgs_gff[[i]]<-data.frame(matrix(nrow=length(goi[,1]),ncol=81))
+	avgs_gff[[i]][,1]<-goi[,4]
+	mybam<-readGAlignments(paste("../code/minimap2_hq/",targets$alias[i],".sorted.bam",sep=''))
+	bamcov<-coverage(mybam)
+	bamcov_norm<-(bamcov*1e6)/length(mybam)
+	
+
+	temp<-readGFF("../code/cupcake/tas10_total.collapsed.gff")
+	abund<-read.table("../code/cupcake/tas10_total.collapsed.abundance.txt",sep='\t',as.is=T,header=T)
+	temp.gr<-makeGRangesFromDataFrame(temp,keep.extra.columns=T)
+
+	ignored<-read.table("../code/cupcake/tas10_total.ignored_ids.txt",sep='\t',as.is=T,header=F)
+	id_match<-read.table("../code/cupcake/tas10_total.collapsed.group.txt",sep='\t',as.is=T,header=F)
+
+	mcols(temp.gr)$txid<-id_match[match(mcols(temp.gr)$transcript_id,id_match[,1]),2]
+	mcols(temp.gr)$ignored<-ignored[match(mcols(temp.gr)$txid,ignored[,1]),2]
+	mcols(temp.gr)$abund<-abund[match(mcols(temp.gr)$transcript_id,abund[,1]),3]
+
+	gffcov<-coverage(temp.gr,weight=mcols(temp.gr)$abund)
+	gffcov_norm<-(gffcov*1e6)/length(temp.gr)
+
+	for(j in 1:length(goi[,1]))
+	{
+		if(goi$strand.gene[j] == "+")
+		{
+			upstream <- window(bamcov_norm[[goi$chrom[j]]],endcheck(goi$chrom[j],goi$start.gene[j]-1000),endcheck(goi$chrom[j],goi$start.gene[j]))
+			genebody <- window(bamcov_norm[[goi$chrom[j]]],endcheck(goi$chrom[j],goi$start.gene[j]),endcheck(goi$chrom[j],goi$end.gene[j]))
+			downstream <- window(bamcov_norm[[goi$chrom[j]]],endcheck(goi$chrom[j],goi$end.gene[j]),endcheck(goi$chrom[j],goi$end.gene[j]+1000))
+
+			upstream_gff <- window(gffcov_norm[[goi$chrom[j]]],endcheck(goi$chrom[j],goi$start.gene[j]-1000),endcheck(goi$chrom[j],goi$start.gene[j]))
+			genebody_gff <- window(gffcov_norm[[goi$chrom[j]]],endcheck(goi$chrom[j],goi$start.gene[j]),endcheck(goi$chrom[j],goi$end.gene[j]))
+			downstream_gff <- window(gffcov_norm[[goi$chrom[j]]],endcheck(goi$chrom[j],goi$end.gene[j]),endcheck(goi$chrom[j],goi$end.gene[j]+1000))
+
+         if(length(upstream)>1 & length(genebody) > 1 & length(downstream) > 1 & (length(which(is.na(upstream))) < length(upstream) | length(which(is.na(genebody))) < length(genebody) | 
+			length(which(is.na(downstream))) < length(downstream)))
+         {
+            avgs[[i]][j,2:21]<-approx(upstream,n=20)$y
+            avgs[[i]][j,22:61]<-approx(genebody,n=40)$y
+            avgs[[i]][j,62:81]<-approx(downstream,n=20)$y
+         }else
+         {
+            avgs[[i]][j,2:81]<-NA
+         }
+         if(length(upstream_gff)>1 & length(genebody_gff) > 1 & length(downstream_gff) > 1 & (length(which(is.na(upstream_gff))) < length(upstream_gff) 
+			| length(which(is.na(genebody_gff))) < length(genebody_gff) | length(which(is.na(downstream_gff))) < length(downstream_gff)))
+			{
+            avgs_gff[[i]][j,2:21]<-approx(upstream_gff,n=20)$y
+            avgs_gff[[i]][j,23:61]<-approx(genebody_gff,n=40)$y
+            avgs_gff[[i]][j,62:81]<-approx(downstream_gff,n=20)$y
+			}else
+			{
+            avgs_gff[[i]][j,2:81]<-NA
+			}
+		} else if (goi$strand.gene[j]=="-")
+		{
+			upstream <- window(bamcov_norm[[goi$chrom[j]]],endcheck(goi$chrom[j],goi$start.gene[j]-1000),endcheck(goi$chrom[j],goi$start.gene[j]))
+			genebody <- window(bamcov_norm[[goi$chrom[j]]],endcheck(goi$chrom[j],goi$start.gene[j]),endcheck(goi$chrom[j],goi$end.gene[j]))
+			downstream <- window(bamcov_norm[[goi$chrom[j]]],endcheck(goi$chrom[j],goi$end.gene[j]),endcheck(goi$chrom[j],goi$end.gene[j]+1000))
+			upstream_gff <- window(gffcov_norm[[goi$chrom[j]]],endcheck(goi$chrom[j],goi$start.gene[j]-1000),endcheck(goi$chrom[j],goi$start.gene[j]))
+			genebody_gff <- window(gffcov_norm[[goi$chrom[j]]],endcheck(goi$chrom[j],goi$start.gene[j]),endcheck(goi$chrom[j],goi$end.gene[j]))
+			downstream_gff <- window(gffcov_norm[[goi$chrom[j]]],endcheck(goi$chrom[j],goi$end.gene[j]),endcheck(goi$chrom[j],goi$end.gene[j]+1000))
+
+         if(length(upstream)>1 & length(genebody) > 1 & length(downstream) > 1 & (length(which(is.na(upstream))) < length(upstream) | length(which(is.na(genebody))) < length(genebody)
+			| length(which(is.na(downstream))) < length(downstream)))
+         {
+            avgs[[i]][j,2:21]<-approx(rev(downstream),n=20)$y
+            avgs[[i]][j,22:61]<-approx(rev(genebody),n=40)$y
+            avgs[[i]][j,62:81]<-approx(rev(upstream),n=20)$y
+         }else
+         {
+            avgs[[i]][j,2:81]<-NA
+         }
+         if(length(upstream_gff)>1 & length(genebody_gff) > 1 & length(downstream_gff) > 1 & (length(which(is.na(upstream_gff))) < length(upstream_gff) 
+			| length(which(is.na(genebody_gff))) < length(genebody_gff) | length(which(is.na(downstream_gff))) < length(downstream_gff)))
+         {
+            avgs_gff[[i]][j,2:21]<-approx(rev(downstream_gff),n=20)$y
+            avgs_gff[[i]][j,22:61]<-approx(rev(genebody_gff),n=40)$y
+            avgs_gff[[i]][j,62:81]<-approx(rev(upstream_gff),n=20)$y
+			}else
+			{
+            avgs_gff[[i]][j,2:81]<-NA
+			}
+		}
+	}
+}
+#things that are not in the abundance file from cupcake are too low, is my current theory. Holds true for PB.1.1, I think, which is transcript/15638.
+
+#So, instead of having one data frame per sample, need to have one data frame for each gene, with the values for each sample in the rows.
+
+c("HIST2H2AA4", "PAICS", "ERAP2", "KDM5C", "TSIX", "XIST")
+goi$sym<-genedata[match(goi[,4],genedata[,1]),2]
+hist<-data.frame(matrix(NA,nrow=24,ncol=80))
+paics<-data.frame(matrix(NA,nrow=24,ncol=80))
+erap2<-data.frame(matrix(NA,nrow=24,ncol=80))
+kdm5c<-data.frame(matrix(NA,nrow=24,ncol=80))
+tsix<-data.frame(matrix(NA,nrow=24,ncol=80))
+xist<-data.frame(matrix(NA,nrow=24,ncol=80))
+for(i in 1:length(avgs))
+{
+	hist[i,]<-avgs[[i]][1,2:81]
+	paics[i,]<-avgs[[i]][2,2:81]
+	erap2[i,]<-avgs[[i]][3,2:81]
+	kdm5c[i,]<-avgs[[i]][4,2:81]
+	tsix[i,]<-avgs[[i]][5,2:81]
+	xist[i,]<-avgs[[i]][6,2:81]
+}
+
+rownames(paics)<-rownames(hist)<-rownames(erap2)<-rownames(kdm5c)<-rownames(tsix)<-rownames(xist)<-targets$alias
+healthy_male_total<-c("tas10_total","tas23_total")
+dis_male_total<-c("tas1_total","tas18_total","tas20_total")
+healthy_female_total<-c("tas11_total","tas22_total","tas30_total")
+dis_female_total<-c("tas2_total","tas19_total","tas21_total","tas29_total")
+
+healthy_male_mrna<-c("tas10_mrna","tas23_mrna")
+dis_male_mrna<-c("tas1_mrna","tas18_mrna","tas20_mrna")
+healthy_female_mrna<-c("tas11_mrna","tas22_mrna","tas30_mrna")
+dis_female_mrna<-c("tas2_mrna","tas19_mrna","tas21_mrna","tas29_mrna")
+
+list_of_samples<-list(healthy_male_total,dis_male_total,healthy_female_total,dis_female_total,healthy_male_mrna,dis_male_mrna,healthy_female_mrna,dis_female_mrna)
+names(list_of_samples)<-c("healthy_male_total","dis_male_total","healthy_female_total","dis_female_total","healthy_male_mrna","dis_male_mrna","healthy_female_mrna","dis_female_mrna")
+
+genes<-list(hist,erap2,kdm5c,tsix,xist,paics)
+names(genes)<-c("HIST2H2AA4","ERAP2","KDM5C","TSIX","XIST","PAICS")
+
+#need to make a plot for each category, maybe show the different lines all on one plot.
+#pdf("averages_goi.indiv.pdf")
+for(i in 1:length(list_of_samples))
+{
+	for(k in 1:length(genes))
+	{
+		jpeg(paste("average_goi.indiv.",names(genes)[k],".jpg",sep=''),height=800,width=1000)
+		par(oma=c(2,2,5,2),mar=c(5,5,5,5))
+		ymax<-max(genes[[k]][rownames(genes[[k]]) %in% list_of_samples[[i]],])+ max(genes[[k]][rownames(genes[[k]]) %in% list_of_samples[[i]],])/8
+		plot(colMeans(genes[[k]][rownames(genes[[k]]) %in% list_of_samples[[i]],][1,],na.rm=T),type='l',main=paste(names(list_of_samples)[i]," samples, ",names(genes)[k],sep=''),ylab="bam coverage",ylim=c(0,ymax))
+		for(j in 2:length(list_of_samples[[i]]))
+		{
+				lines(colMeans(genes[[k]][rownames(genes[[k]]) %in% list_of_samples[[i]],][j,],na.rm=T),lty=j)
+				#plot(colMeans(genes[[k]][rownames(genes[[k]]) %in% list_of_samples[[i]],][j,],na.rm=T),type='l',main=paste(list_of_samples[[i]][j]," sample blah, HIST2H2AA4"),ylab="bam coverage")
+		}
+		legend("topright",legend=list_of_samples[[i]],lty=1:length(list_of_samples[[i]]),bg="white",cex=1)
+		dev.off()
+	}
+}
+#dev.off()
+
+#then, average the samples for each list_of_samples entry, and plot in the same plot with 4 colors - healthy male, healthy female, dis male, dis female (total) and then mrna.
+averaged_data<-list()
+for(k in 1:length(genes))
+{
+	averaged_data[[k]]<-list()
+	for(i in 1:length(list_of_samples))
+	{
+		averaged_data[[k]][[i]]<-colMeans(genes[[k]][rownames(genes[[k]]) %in% list_of_samples[[i]],],na.rm=T)
+   }
+	names(averaged_data[[k]])<-names(list_of_samples)
+}
+names(averaged_data)<-names(genes)
+
+cols<-c(brewer.pal(8,"Dark2")[1:4],"red","darkgreen","goldenrod2","blue")
+#make a plot with lines for the first four list elements for every gene with diff colors/ltys.
+#pdf("averages_goi.combined.pdf")
+for(k in 1:length(genes))
+{
+	for(i in c(1,5))
+	{
+		ymax<-max(unlist(averaged_data[[k]][i:(i+3)]))
+		jpeg(paste("average_goi.combined.",names(genes)[k],".jpg",sep=''),height=800,width=1000)
+		par(oma=c(2,2,5,2),mar=c(5,5,5,14),xpd=T)
+		plot(averaged_data[[k]][[i]],type="l",col=cols[i],ylim=c(0,ymax),ylab="averaged rpm normalized coverage",main=names(genes)[k],xaxt='n')
+		axis(1,at=c(1,20,60,80),labels=c("-1kb","TSS","TES","1kb"))
+		for(j in 1:3)
+		{
+			lines(averaged_data[[k]][[i+j]],type="l",col=cols[i+j])
+		}
+		legend("topright",inset=c(-.27,0),legend=names(averaged_data[[k]][i:(i+3)]),col=cols[i:(i+3)],lty=1,cex=1,bg="white")
+		dev.off()
+	}
+}
+saveRDS(genes,"genes.rds")
+saveRDS(averaged_data,"averaged_data.rds")
+saveRDS(list_of_samples,"list_of_samples.rds")
+
+#make plots for some more genes, total RNA only, tas email 6/16/2020.
+#pink(red), green, yellow, blue, legend outside graph, jpeg
+genelist<-c("HIST2H2AA4", "H2AFZ", "HIST1H3E", "HIST4H4", "HIST1H2BC", "HIST1H2AA", "HIST1H3F", "HIST1H4F", "KDM5C", "ATRX", "KDM5D", "NLGN4Y", "NLGN4Y-AS1", "TMSB4Y", "TMSB4X","DDX3Y","KANTR","HMGCS1","USP9Y","USP9X")
+
+ensids<-genedata[genedata[,2] %in% genelist,1]
+goi<-bed[bed[,4] %in% ensids,]
+
+library(rtracklayer)
+library(GenomicAlignments)
+avgs<-list()
+avgs_gff<-list()
+for(i in 1:length(targets[,1]))
+{
+	avgs[[i]]<-data.frame(matrix(nrow=length(goi[,1]),ncol=81))
+	avgs[[i]][,1]<-goi[,4]
+
+	avgs_gff[[i]]<-data.frame(matrix(nrow=length(goi[,1]),ncol=81))
+	avgs_gff[[i]][,1]<-goi[,4]
+	mybam<-readGAlignments(paste("../code/minimap2_hq/",targets$alias[i],".sorted.bam",sep=''))
+	bamcov<-coverage(mybam)
+	bamcov_norm<-(bamcov*1e6)/length(mybam)
+	
+
+	temp<-readGFF("../code/cupcake/tas10_total.collapsed.gff")
+	abund<-read.table("../code/cupcake/tas10_total.collapsed.abundance.txt",sep='\t',as.is=T,header=T)
+	temp.gr<-makeGRangesFromDataFrame(temp,keep.extra.columns=T)
+
+	ignored<-read.table("../code/cupcake/tas10_total.ignored_ids.txt",sep='\t',as.is=T,header=F)
+	id_match<-read.table("../code/cupcake/tas10_total.collapsed.group.txt",sep='\t',as.is=T,header=F)
+
+	mcols(temp.gr)$txid<-id_match[match(mcols(temp.gr)$transcript_id,id_match[,1]),2]
+	mcols(temp.gr)$ignored<-ignored[match(mcols(temp.gr)$txid,ignored[,1]),2]
+	mcols(temp.gr)$abund<-abund[match(mcols(temp.gr)$transcript_id,abund[,1]),3]
+
+	gffcov<-coverage(temp.gr,weight=mcols(temp.gr)$abund)
+	gffcov_norm<-(gffcov*1e6)/length(temp.gr)
+
+	for(j in 1:length(goi[,1]))
+	{
+		if(goi$strand.gene[j] == "+")
+		{
+			upstream <- window(bamcov_norm[[goi$chrom[j]]],endcheck(goi$chrom[j],goi$start.gene[j]-1000),endcheck(goi$chrom[j],goi$start.gene[j]))
+			genebody <- window(bamcov_norm[[goi$chrom[j]]],endcheck(goi$chrom[j],goi$start.gene[j]),endcheck(goi$chrom[j],goi$end.gene[j]))
+			downstream <- window(bamcov_norm[[goi$chrom[j]]],endcheck(goi$chrom[j],goi$end.gene[j]),endcheck(goi$chrom[j],goi$end.gene[j]+1000))
+
+			upstream_gff <- window(gffcov_norm[[goi$chrom[j]]],endcheck(goi$chrom[j],goi$start.gene[j]-1000),endcheck(goi$chrom[j],goi$start.gene[j]))
+			genebody_gff <- window(gffcov_norm[[goi$chrom[j]]],endcheck(goi$chrom[j],goi$start.gene[j]),endcheck(goi$chrom[j],goi$end.gene[j]))
+			downstream_gff <- window(gffcov_norm[[goi$chrom[j]]],endcheck(goi$chrom[j],goi$end.gene[j]),endcheck(goi$chrom[j],goi$end.gene[j]+1000))
+
+         if(length(upstream)>1 & length(genebody) > 1 & length(downstream) > 1 & (length(which(is.na(upstream))) < length(upstream) | length(which(is.na(genebody))) < length(genebody) | 
+			length(which(is.na(downstream))) < length(downstream)))
+         {
+            avgs[[i]][j,2:21]<-approx(upstream,n=20)$y
+            avgs[[i]][j,22:61]<-approx(genebody,n=40)$y
+            avgs[[i]][j,62:81]<-approx(downstream,n=20)$y
+         }else
+         {
+            avgs[[i]][j,2:81]<-NA
+         }
+         if(length(upstream_gff)>1 & length(genebody_gff) > 1 & length(downstream_gff) > 1 & (length(which(is.na(upstream_gff))) < length(upstream_gff) 
+			| length(which(is.na(genebody_gff))) < length(genebody_gff) | length(which(is.na(downstream_gff))) < length(downstream_gff)))
+			{
+            avgs_gff[[i]][j,2:21]<-approx(upstream_gff,n=20)$y
+            avgs_gff[[i]][j,23:61]<-approx(genebody_gff,n=40)$y
+            avgs_gff[[i]][j,62:81]<-approx(downstream_gff,n=20)$y
+			}else
+			{
+            avgs_gff[[i]][j,2:81]<-NA
+			}
+		} else if (goi$strand.gene[j]=="-")
+		{
+			upstream <- window(bamcov_norm[[goi$chrom[j]]],endcheck(goi$chrom[j],goi$start.gene[j]-1000),endcheck(goi$chrom[j],goi$start.gene[j]))
+			genebody <- window(bamcov_norm[[goi$chrom[j]]],endcheck(goi$chrom[j],goi$start.gene[j]),endcheck(goi$chrom[j],goi$end.gene[j]))
+			downstream <- window(bamcov_norm[[goi$chrom[j]]],endcheck(goi$chrom[j],goi$end.gene[j]),endcheck(goi$chrom[j],goi$end.gene[j]+1000))
+			upstream_gff <- window(gffcov_norm[[goi$chrom[j]]],endcheck(goi$chrom[j],goi$start.gene[j]-1000),endcheck(goi$chrom[j],goi$start.gene[j]))
+			genebody_gff <- window(gffcov_norm[[goi$chrom[j]]],endcheck(goi$chrom[j],goi$start.gene[j]),endcheck(goi$chrom[j],goi$end.gene[j]))
+			downstream_gff <- window(gffcov_norm[[goi$chrom[j]]],endcheck(goi$chrom[j],goi$end.gene[j]),endcheck(goi$chrom[j],goi$end.gene[j]+1000))
+
+         if(length(upstream)>1 & length(genebody) > 1 & length(downstream) > 1 & (length(which(is.na(upstream))) < length(upstream) | length(which(is.na(genebody))) < length(genebody)
+			| length(which(is.na(downstream))) < length(downstream)))
+         {
+            avgs[[i]][j,2:21]<-approx(rev(downstream),n=20)$y
+            avgs[[i]][j,22:61]<-approx(rev(genebody),n=40)$y
+            avgs[[i]][j,62:81]<-approx(rev(upstream),n=20)$y
+         }else
+         {
+            avgs[[i]][j,2:81]<-NA
+         }
+         if(length(upstream_gff)>1 & length(genebody_gff) > 1 & length(downstream_gff) > 1 & (length(which(is.na(upstream_gff))) < length(upstream_gff) 
+			| length(which(is.na(genebody_gff))) < length(genebody_gff) | length(which(is.na(downstream_gff))) < length(downstream_gff)))
+         {
+            avgs_gff[[i]][j,2:21]<-approx(rev(downstream_gff),n=20)$y
+            avgs_gff[[i]][j,22:61]<-approx(rev(genebody_gff),n=40)$y
+            avgs_gff[[i]][j,62:81]<-approx(rev(upstream_gff),n=20)$y
+			}else
+			{
+            avgs_gff[[i]][j,2:81]<-NA
+			}
+		}
+	}
+}
+#things that are not in the abundance file from cupcake are too low, is my current theory. Holds true for PB.1.1, I think, which is transcript/15638.
+names(avgs)<-targets$alias
+
+#So, instead of having one data frame per sample, need to have one data frame for each gene, with the values for each sample in the rows.
+
+#HERE
+#("HIST2H2AA4", "H2AFZ", "HIST1H3E", "HIST4H4", "HIST1H2BC", "HIST1H2AA", "HIST1H3F", "HIST1H4F", "KDM5C", "ATRX", "KDM5D", "NLGN4Y", "NLGN4Y-AS1", "TMSB4Y", "TMSB4X","DDX3Y","KANTR","HMGCS1","USP9Y","USP9X")
+goi$sym<-genedata[match(goi[,4],genedata[,1]),2]
+generows<-list()
+for(i in 1:length(goi[,1]))
+{
+	generows[[i]]<-data.frame(matrix(NA,nrow=24,ncol=80))
+	rownames(generows[[i]])<-targets$alias
+}
+names(generows)<-goi$sym
+
+for(i in 1:length(avgs))
+{
+	for(j in 1:length(generows))
+	{
+		generows[[j]][i,]<-avgs[[i]][j,2:81]
+	}
+}
+
+healthy_male_total<-c("tas10_total","tas23_total")
+dis_male_total<-c("tas1_total","tas18_total","tas20_total")
+healthy_female_total<-c("tas11_total","tas22_total","tas30_total")
+dis_female_total<-c("tas2_total","tas19_total","tas21_total","tas29_total")
+
+healthy_male_mrna<-c("tas10_mrna","tas23_mrna")
+dis_male_mrna<-c("tas1_mrna","tas18_mrna","tas20_mrna")
+healthy_female_mrna<-c("tas11_mrna","tas22_mrna","tas30_mrna")
+dis_female_mrna<-c("tas2_mrna","tas19_mrna","tas21_mrna","tas29_mrna")
+
+list_of_samples<-list(healthy_male_total,dis_male_total,healthy_female_total,dis_female_total,healthy_male_mrna,dis_male_mrna,healthy_female_mrna,dis_female_mrna)
+names(list_of_samples)<-c("healthy_male_total","dis_male_total","healthy_female_total","dis_female_total","healthy_male_mrna","dis_male_mrna","healthy_female_mrna","dis_female_mrna")
+
+#genes<-list(hist,erap2,kdm5c,tsix,xist,paics)
+#names(genes)<-c("HIST2H2AA4","ERAP2","KDM5C","TSIX","XIST","PAICS")
+
+#need to make a plot for each category, maybe show the different lines all on one plot.
+#pdf("averages_goi.indiv.6-23-2020.pdf")
+for(i in 1:length(list_of_samples))
+{
+	for(k in 1:length(generows))
+	{
+		jpeg(paste("average_goi.indiv.",names(generows)[k],".6-23-2020.jpg",sep=''),height=800,width=1000)
+		par(oma=c(2,2,5,2),mar=c(5,5,5,5))
+		ymax<-max(generows[[k]][rownames(generows[[k]]) %in% list_of_samples[[i]],])+ max(generows[[k]][rownames(generows[[k]]) %in% list_of_samples[[i]],])/8
+		plot(colMeans(generows[[k]][rownames(generows[[k]]) %in% list_of_samples[[i]],][1,],na.rm=T),type='l',main=paste(names(list_of_samples)[i]," samples, ",names(generows)[k],sep=''),ylab="bam coverage",ylim=c(0,ymax))
+		for(j in 2:length(list_of_samples[[i]]))
+		{
+				lines(colMeans(generows[[k]][rownames(generows[[k]]) %in% list_of_samples[[i]],][j,],na.rm=T),lty=j)
+				#plot(colMeans(generows[[k]][rownames(generows[[k]]) %in% list_of_samples[[i]],][j,],na.rm=T),type='l',main=paste(list_of_samples[[i]][j]," sample blah, HIST2H2AA4"),ylab="bam coverage")
+		}
+		legend("topright",legend=list_of_samples[[i]],lty=1:length(list_of_samples[[i]]),bg="white",cex=1)
+		dev.off()
+	}
+}
+#dev.off()
+
+#then, average the samples for each list_of_samples entry, and plot in the same plot with 4 colors - healthy male, healthy female, dis male, dis female (total) and then mrna.
+averaged_data<-list()
+for(k in 1:length(generows))
+{
+	averaged_data[[k]]<-list()
+	for(i in 1:length(list_of_samples))
+	{
+		averaged_data[[k]][[i]]<-colMeans(generows[[k]][rownames(generows[[k]]) %in% list_of_samples[[i]],],na.rm=T)
+   }
+	names(averaged_data[[k]])<-names(list_of_samples)
+}
+names(averaged_data)<-names(generows)
+
+cols<-c(brewer.pal(8,"Dark2")[1:4],"red","darkgreen","goldenrod2","blue")
+cols<-c("red","darkgreen","goldenrod2","blue",brewer.pal(8,"Dark2")[1:4])
+#make a plot with lines for the first four list elements for every gene with diff colors/ltys.
+#pdf("averages_goi.combined.pdf")
+for(k in 1:length(generows))
+{
+	for(i in c(1))
+	{
+		ymax<-max(unlist(averaged_data[[k]][i:(i+3)]))
+		jpeg(paste("average_goi.combined.",names(generows)[k],".6-23-2020.jpg",sep=''),height=800,width=1000)
+		par(oma=c(2,2,5,2),mar=c(5,5,5,14),xpd=T)
+		plot(averaged_data[[k]][[i]],type="l",col=cols[i],ylim=c(0,ymax),ylab="averaged rpm normalized coverage",main=names(generows)[k],xaxt='n')
+		axis(1,at=c(1,20,60,80),labels=c("-1kb","TSS","TES","1kb"))
+		for(j in 1:3)
+		{
+			lines(averaged_data[[k]][[i+j]],type="l",col=cols[i+j])
+		}
+		legend("topright",inset=c(-.27,0),legend=names(averaged_data[[k]][i:(i+3)]),col=cols[i:(i+3)],lty=1,cex=1,bg="white")
+		dev.off()
+	}
+}
+
+
+```
